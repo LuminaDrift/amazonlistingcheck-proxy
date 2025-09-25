@@ -1,361 +1,195 @@
+// server.js — Express proxy/control shim for Amazon listing checks
+// Node >= 18 (global fetch available). package.json should have "type":"module".
+
 import express from 'express';
 import cors from 'cors';
-import SellingPartnerAPI from 'amazon-sp-api';
 
 const app = express();
+
+// ---------- Config via environment ----------
+const PORT         = Number(process.env.PORT) || 3000;
+const UI_KEY       = process.env.UI_KEY || '';             // optional UI key to protect /control/*
+const UPSTREAM_URL = (process.env.UPSTREAM_URL || '').replace(/\/+$/,''); // optional: proxy to real SP-API worker
+const MOCK_SPAPI   = process.env.MOCK_SPAPI === '0' ? false : true;       // default true when no UPSTREAM_URL
+
+// ---------- Middleware ----------
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' }));
 
-// ---------- Config via ENV ----------
-const {
-  PORT = 3000,
-
-  // LWA (Login With Amazon)
-  LWA_CLIENT_ID,
-  LWA_CLIENT_SECRET,
-
-  // Refresh token for the selling partner
-  SPAPI_REFRESH_TOKEN,
-
-  // AWS keys (role is recommended if you have it)
-  AWS_ACCESS_KEY_ID,
-  AWS_SECRET_ACCESS_KEY,
-  AWS_SELLING_PARTNER_ROLE // optional role ARN
-} = process.env;
-
-// ---------- Helpers ----------
-const MP_REGION = {
-  // EU
-  A1F83G8C2ARO7P: 'eu', // UK
-  A13V1IB3VIYZZH: 'eu', // FR
-  APJ6JRA9NG5V4: 'eu',  // IT
-  A1RKKUPIHCS9HS: 'eu', // ES
-  A1805IZSGTT6HS: 'eu', // NL
-  A1C3SOZRARQ6R3: 'eu', // PL
-  A2NODRKZP88ZB9: 'eu', // SE
-  AMEN7PMS3EDWL: 'eu',  // BE
-  // NA + FE
-  ATVPDKIKX0DER: 'na',  // US
-  A1VC38T7YXB528: 'fe', // JP
-  A39IBJ37TRP1C6: 'fe'  // AU
-};
-
-function getRegionFor(mpId) {
-  const r = MP_REGION[mpId];
-  if (!r) throw new Error(`Unsupported marketplace: ${mpId}`);
-  return r;
+// Simple UI-key check for /control routes (optional)
+function checkUiKey(req, res, next) {
+  if (!UI_KEY) return next(); // open if not configured
+  const k = (req.query.k || req.headers['x-ui-key'] || '').toString();
+  if (k === UI_KEY) return next();
+  return res.status(401).json({ ok: false, error: 'unauthorized' });
 }
 
-function newSpClient(region) {
-  const opts = {
-    region,
-    refresh_token: SPAPI_REFRESH_TOKEN,
-    credentials: {
-      SELLING_PARTNER_APP_CLIENT_ID: LWA_CLIENT_ID,
-      SELLING_PARTNER_APP_CLIENT_SECRET: LWA_CLIENT_SECRET,
-      AWS_ACCESS_KEY_ID,
-      AWS_SECRET_ACCESS_KEY,
-      role: AWS_SELLING_PARTNER_ROLE || undefined
-    }
-  };
-  return new SellingPartnerAPI(opts);
-}
-
-// simple concurrency limiter without extra deps
-async function mapLimit(items, limit, worker) {
-  const results = new Array(items.length);
-  let i = 0, running = 0;
-
-  return new Promise((resolve) => {
-    const next = () => {
-      if (i >= items.length && running === 0) return resolve(results);
-      while (running < limit && i < items.length) {
-        const idx = i++;
-        running++;
-        Promise.resolve(worker(items[idx], idx))
-          .then((res) => { results[idx] = res; })
-          .catch((err) => { results[idx] = { error: String(err && err.message || err) }; })
-          .finally(() => { running--; next(); });
-      }
-    };
-    next();
-  });
-}
-
-// format restriction => 'Open' | 'Closed'
-function normalizeRestriction(resp) {
-  try {
-    if (!resp || resp.error) return { status: 'Closed' };
-    const d = resp.restrictions || resp; // different shapes
-    // If there are no reasons or status explicitly 'OPEN'
-    if (Array.isArray(d) && d.length === 0) return { status: 'Open' };
-    if (Array.isArray(d) && d.some(x => x && x.restriction)) return { status: 'Closed' };
-
-    const st = (resp.status || '').toString().toLowerCase();
-    if (st === 'open') return { status: 'Open' };
-    return { status: 'Closed' };
-  } catch {
-    return { status: 'Closed' };
-  }
-}
-
-// returns boolean “hasNewOffers”
-function normalizeOffers(resp) {
-  try {
-    if (!resp || resp.error) return false;
-    const offers = resp.Offers || resp.offers || resp.payload?.Offers || resp.payload?.offers || resp.payload;
-    if (Array.isArray(offers)) return offers.length > 0;
-    // Some SDKs return { payload: { offers: [...] } }
-    const arr = offers?.offers || offers?.Offers;
-    return Array.isArray(arr) ? arr.length > 0 : false;
-  } catch {
-    return false;
-  }
-}
-
-// ---------- Endpoints ----------
-
-app.get('/health', (_req, res) => {
+// ---------- Health ----------
+app.get('/health', (req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
-/**
- * POST /restrictions
- * body: { asin, marketplaceIds: string[], conditionType?: 'new_new'|'used_like_new'... }
- */
-app.post('/restrictions', async (req, res) => {
-  try {
-    const { asin, marketplaceIds = [], conditionType = 'new_new' } = req.body || {};
-    if (!asin || !Array.isArray(marketplaceIds) || marketplaceIds.length === 0) {
-      return res.status(400).json({ error: 'Provide asin and marketplaceIds[]' });
-    }
-
-    // call each marketplace (limit concurrency a bit)
-    const results = {};
-    await mapLimit(marketplaceIds, 5, async (mpId) => {
-      const region = getRegionFor(mpId);
-      const sp = newSpClient(region);
-      try {
-        const resp = await sp.callAPI({
-          operation: 'getListingsRestrictions',
-          endpoint: 'listingsRestrictions',
-          path: { asin },
-          query: { sellerId: undefined, marketplaceIds: mpId, conditionType }
-        });
-        results[mpId] = normalizeRestriction(resp);
-      } catch (e) {
-        results[mpId] = { status: 'Closed', error: String(e?.message || e) };
-      }
-    });
-
-    res.json({ results });
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
-});
-
-/**
- * POST /offers
- * body: { asin, marketplaceIds: string[], itemCondition?: 'New'|'Used' }
- */
-app.post('/offers', async (req, res) => {
-  try {
-    const { asin, marketplaceIds = [], itemCondition = 'New' } = req.body || {};
-    if (!asin || !Array.isArray(marketplaceIds) || marketplaceIds.length === 0) {
-      return res.status(400).json({ error: 'Provide asin and marketplaceIds[]' });
-    }
-
-    const results = {};
-    await mapLimit(marketplaceIds, 5, async (mpId) => {
-      const region = getRegionFor(mpId);
-      const sp = newSpClient(region);
-      try {
-        // Use Catalog Items or Product Pricing offers; here we use Product Pricing getItemOffers
-        const resp = await sp.callAPI({
-          operation: 'getItemOffers',
-          endpoint: 'productPricing',
-          query: {
-            MarketplaceId: mpId,
-            ItemCondition: itemCondition
-          },
-          path: { Asin: asin }
-        });
-        results[mpId] = { hasNewOffers: normalizeOffers(resp) };
-      } catch (e) {
-        results[mpId] = { hasNewOffers: false, error: String(e?.message || e) };
-      }
-    });
-
-    res.json({ results });
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
-});
-
-/**
- * POST /restrictionsBatch
- * body: { asins: string[], marketplaceIds: string[], conditionType?: 'new_new' }
- * Note: keep asins <= 100 per request
- */
-app.post('/restrictionsBatch', async (req, res) => {
-  try {
-    const { asins = [], marketplaceIds = [], conditionType = 'new_new' } = req.body || {};
-    if (!Array.isArray(asins) || asins.length === 0) return res.status(400).json({ error: 'Provide asins[]' });
-    if (!Array.isArray(marketplaceIds) || marketplaceIds.length === 0) return res.status(400).json({ error: 'Provide marketplaceIds[]' });
-
-    const out = {};
-    // limit overall concurrency to avoid SP-API throttles
-    await mapLimit(asins, 8, async (asin) => {
-      const row = {};
-      await mapLimit(marketplaceIds, 5, async (mpId) => {
-        const region = getRegionFor(mpId);
-        const sp = newSpClient(region);
-        try {
-          const resp = await sp.callAPI({
-            operation: 'getListingsRestrictions',
-            endpoint: 'listingsRestrictions',
-            path: { asin },
-            query: { marketplaceIds: mpId, conditionType }
-          });
-          row[mpId] = normalizeRestriction(resp);
-        } catch (e) {
-          row[mpId] = { status: 'Closed', error: String(e?.message || e) };
-        }
-      });
-      out[asin] = row;
-    });
-
-    res.json({ results: out });
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
-});
-
-/**
- * POST /offersBatch
- * body: { asins: string[], marketplaceIds: string[], itemCondition?: 'New' }
- */
-app.post('/offersBatch', async (req, res) => {
-  try {
-    const { asins = [], marketplaceIds = [], itemCondition = 'New' } = req.body || {};
-    if (!Array.isArray(asins) || asins.length === 0) return res.status(400).json({ error: 'Provide asins[]' });
-    if (!Array.isArray(marketplaceIds) || marketplaceIds.length === 0) return res.status(400).json({ error: 'Provide marketplaceIds[]' });
-
-    const out = {};
-    await mapLimit(asins, 8, async (asin) => {
-      const row = {};
-      await mapLimit(marketplaceIds, 5, async (mpId) => {
-        const region = getRegionFor(mpId);
-        const sp = newSpClient(region);
-        try {
-          const resp = await sp.callAPI({
-            operation: 'getItemOffers',
-            endpoint: 'productPricing',
-            query: { MarketplaceId: mpId, ItemCondition: itemCondition },
-            path: { Asin: asin }
-          });
-          row[mpId] = { hasNewOffers: normalizeOffers(resp) };
-        } catch (e) {
-          row[mpId] = { hasNewOffers: false, error: String(e?.message || e) };
-        }
-      });
-      out[asin] = row;
-    });
-
-    res.json({ results: out });
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
-});
-
-// --- Add this block near the bottom of server.js, above app.listen(...) ---
-
-// If you don't already have these:
-import express from 'express';
-import cors from 'cors';
-
-// If your file already created the app & middlewares, skip these two:
-const app = globalThis.app || express();
-app.use(cors());
-app.use(express.json());
-
-// Optional UI key (leave blank to disable auth)
-const UI_KEY = process.env.UI_KEY || '';
-
-function checkUiKey(req, res, next) {
-  if (!UI_KEY) return next(); // no key required
-  const k = (req.query.k || req.headers['x-ui-key'] || '').toString();
-  if (k === UI_KEY) return next();
-  return res.status(401).json({ ok: false, error: 'unauthorized' });
-}
-
-// Simple health check
-app.get('/healthz', (_req, res) => {
-  res.status(200).send('ok');
-});
-
-// Control status (optional ?sheetId=... just gets echoed)
-app.get('/control/status', checkUiKey, (req, res) => {
-  const info = {
-    ok: true,
-    time: new Date().toISOString(),
-    version: process.env.RENDER_GIT_COMMIT || 'dev',
-    hasUiKey: !!UI_KEY,
-    sheetId: req.query.sheetId || null
-  };
-  res.json(info);
-});
-
-// Optional: POST control/action so you can test POSTs easily
-app.post('/control/action', checkUiKey, (req, res) => {
-  const { action } = req.body || {};
-  if (!action) return res.status(400).json({ ok: false, error: 'missing action' });
-  // For now just echo back; wire real actions later
-  res.json({ ok: true, action, receivedAt: new Date().toISOString() });
-});
-
-// Ensure PORT is a valid number
-const PORT = Number(process.env.PORT) || 3000;
-app.listen(PORT, () => {
-  console.log(`Server listening on :${PORT}`);
-});
-
-// --- ADD: rotte di controllo ---
-
-// Se hai già `app.use(express.json())`, puoi saltare questa riga:
-app.use(express.json());
-
-// (Opzionale) chiave per proteggere le rotte di controllo: impostala su Render come UI_KEY
-const UI_KEY = process.env.UI_KEY || '';
-
-function checkUiKey(req, res, next) {
-  if (!UI_KEY) return next(); // nessuna chiave richiesta
-  const k = (req.query.k || req.headers['x-ui-key'] || '').toString();
-  if (k === UI_KEY) return next();
-  return res.status(401).json({ ok: false, error: 'unauthorized' });
-}
-
-// /health esiste già nel tuo server e torna JSON; lo lasciamo com'è.
-
-// Stato controllo (GET)
+// ---------- Control (status + test action) ----------
 app.get('/control/status', checkUiKey, (req, res) => {
   res.json({
     ok: true,
     time: new Date().toISOString(),
     version: process.env.RENDER_GIT_COMMIT || 'dev',
-    sheetId: req.query.sheetId || null
+    hasUpstream: !!UPSTREAM_URL,
+    mockMode: !UPSTREAM_URL && MOCK_SPAPI
   });
 });
 
-// Azione di controllo (POST) – per testare una POST semplice
-app.post('/control/action', checkUiKey, (req, res) => {
-  const { action } = req.body || {};
+app.post('/control/action', checkUiKey, async (req, res) => {
+  const { action, payload } = req.body || {};
   if (!action) return res.status(400).json({ ok: false, error: 'missing action' });
-  res.json({ ok: true, action, receivedAt: new Date().toISOString() });
+  // simple echo/ping
+  if (action === 'ping') {
+    return res.json({ ok: true, pong: true, at: new Date().toISOString(), payload: payload || null });
+  }
+  return res.json({ ok: true, received: { action, payload: payload || null } });
 });
 
-// (Assicurati che sotto ci sia UNA sola app.listen(...))
+// ---------- Helpers ----------
+function validateBody(req, keys) {
+  const missing = [];
+  keys.forEach(k => { if (req.body == null || !(k in req.body)) missing.push(k); });
+  return missing;
+}
 
+async function proxyPost(path, body) {
+  if (!UPSTREAM_URL) throw new Error('UPSTREAM_URL not configured');
+  const url = `${UPSTREAM_URL}${path.startsWith('/') ? path : `/${path}`}`;
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await r.text();
+  let json;
+  try { json = JSON.parse(text); } catch {
+    throw new Error(`Upstream non-JSON response: ${text.slice(0,200)}`);
+  }
+  if (!r.ok) {
+    const msg = (json && (json.error || json.message)) ? json.error || json.message : `HTTP ${r.status}`;
+    const err = new Error(`Upstream error: ${msg}`);
+    err.status = r.status;
+    err.payload = json;
+    throw err;
+  }
+  return json;
+}
+
+// ---------- Mock generators (structure-compatible) ----------
+function mockRestrictions(asin, marketplaceIds) {
+  const results = {};
+  (marketplaceIds || []).forEach(m => {
+    // deterministic-ish mock: Open if asin ends with 0–4
+    const last = asin.slice(-1);
+    const openish = /[0-4]/.test(last);
+    results[m] = {
+      exists: true,
+      status: openish ? 'Open' : 'Restricted',
+      reasonCodes: openish ? [] : ['BRAND_RESTRICTED'],
+    };
+  });
+  return { ok: true, results };
+}
+function mockOffers(asin, marketplaceIds) {
+  const results = {};
+  (marketplaceIds || []).forEach(m => {
+    const last = asin.slice(-1);
+    const has = /[02468]/.test(last); // even => has offers
+    results[m] = { hasNewOffers: !!has };
+  });
+  return { ok: true, results };
+}
+
+// ---------- Business endpoints ----------
+// Single-ASIN restrictions (expects { asin, marketplaceIds, conditionType? })
+app.post('/restrictions', async (req, res) => {
+  const missing = validateBody(req, ['asin','marketplaceIds']);
+  if (missing.length) return res.status(400).json({ ok:false, error:`missing fields: ${missing.join(', ')}` });
+
+  try {
+    if (UPSTREAM_URL) {
+      const j = await proxyPost('/restrictions', req.body);
+      return res.json(j);
+    }
+    if (!MOCK_SPAPI) return res.status(501).json({ ok:false, error:'Not configured (set UPSTREAM_URL or enable MOCK_SPAPI)' });
+    return res.json(mockRestrictions(String(req.body.asin), req.body.marketplaceIds));
+  } catch (err) {
+    const code = err.status || 502;
+    return res.status(code).json({ ok:false, error: err.message || 'upstream error', details: err.payload || null });
+  }
+});
+
+// Single-ASIN offers (expects { asin, marketplaceIds, itemCondition?, includeSiblings? })
+app.post('/offers', async (req, res) => {
+  const missing = validateBody(req, ['asin','marketplaceIds']);
+  if (missing.length) return res.status(400).json({ ok:false, error:`missing fields: ${missing.join(', ')}` });
+
+  try {
+    if (UPSTREAM_URL) {
+      const j = await proxyPost('/offers', req.body);
+      return res.json(j);
+    }
+    if (!MOCK_SPAPI) return res.status(501).json({ ok:false, error:'Not configured (set UPSTREAM_URL or enable MOCK_SPAPI)' });
+    return res.json(mockOffers(String(req.body.asin), req.body.marketplaceIds));
+  } catch (err) {
+    const code = err.status || 502;
+    return res.status(code).json({ ok:false, error: err.message || 'upstream error', details: err.payload || null });
+  }
+});
+
+// Optional: batch restrictions (expects { asins:[], marketplaceIds:[] })
+app.post('/restrictions/batch', async (req, res) => {
+  const missing = validateBody(req, ['asins','marketplaceIds']);
+  if (missing.length) return res.status(400).json({ ok:false, error:`missing fields: ${missing.join(', ')}` });
+  const { asins, marketplaceIds } = req.body;
+
+  try {
+    if (UPSTREAM_URL) {
+      const j = await proxyPost('/restrictions/batch', req.body);
+      return res.json(j);
+    }
+    if (!MOCK_SPAPI) return res.status(501).json({ ok:false, error:'Not configured (set UPSTREAM_URL or enable MOCK_SPAPI)' });
+    const out = {};
+    asins.forEach(a => { out[a] = mockRestrictions(String(a), marketplaceIds).results; });
+    return res.json({ ok:true, results: out });
+  } catch (err) {
+    const code = err.status || 502;
+    return res.status(code).json({ ok:false, error: err.message || 'upstream error', details: err.payload || null });
+  }
+});
+
+// Optional: batch offers (expects { asins:[], marketplaceIds:[] })
+app.post('/offers/batch', async (req, res) => {
+  const missing = validateBody(req, ['asins','marketplaceIds']);
+  if (missing.length) return res.status(400).json({ ok:false, error:`missing fields: ${missing.join(', ')}` });
+  const { asins, marketplaceIds } = req.body;
+
+  try {
+    if (UPSTREAM_URL) {
+      const j = await proxyPost('/offers/batch', req.body);
+      return res.json(j);
+    }
+    if (!MOCK_SPAPI) return res.status(501).json({ ok:false, error:'Not configured (set UPSTREAM_URL or enable MOCK_SPAPI)' });
+    const out = {};
+    asins.forEach(a => { out[a] = mockOffers(String(a), marketplaceIds).results; });
+    return res.json({ ok:true, results: out });
+  } catch (err) {
+    const code = err.status || 502;
+    return res.status(code).json({ ok:false, error: err.message || 'upstream error', details: err.payload || null });
+  }
+});
+
+// ---------- 404 handler ----------
+app.use((req, res) => {
+  res.status(404).json({ ok:false, error:'not found', path:req.path });
+});
+
+// ---------- Start server (single listen) ----------
 app.listen(PORT, () => {
-  console.log(`SP-API proxy listening on :${PORT}`);
+  console.log(`Server listening on ${PORT} ${UPSTREAM_URL ? '(proxy mode)' : (MOCK_SPAPI ? '(mock mode)' : '')}`);
 });
