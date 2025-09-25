@@ -268,6 +268,58 @@ app.post('/offersBatch', async (req, res) => {
   }
 });
 
+// --- Add this block near the bottom of server.js, above app.listen(...) ---
+
+// If you don't already have these:
+import express from 'express';
+import cors from 'cors';
+
+// If your file already created the app & middlewares, skip these two:
+const app = globalThis.app || express();
+app.use(cors());
+app.use(express.json());
+
+// Optional UI key (leave blank to disable auth)
+const UI_KEY = process.env.UI_KEY || '';
+
+function checkUiKey(req, res, next) {
+  if (!UI_KEY) return next(); // no key required
+  const k = (req.query.k || req.headers['x-ui-key'] || '').toString();
+  if (k === UI_KEY) return next();
+  return res.status(401).json({ ok: false, error: 'unauthorized' });
+}
+
+// Simple health check
+app.get('/healthz', (_req, res) => {
+  res.status(200).send('ok');
+});
+
+// Control status (optional ?sheetId=... just gets echoed)
+app.get('/control/status', checkUiKey, (req, res) => {
+  const info = {
+    ok: true,
+    time: new Date().toISOString(),
+    version: process.env.RENDER_GIT_COMMIT || 'dev',
+    hasUiKey: !!UI_KEY,
+    sheetId: req.query.sheetId || null
+  };
+  res.json(info);
+});
+
+// Optional: POST control/action so you can test POSTs easily
+app.post('/control/action', checkUiKey, (req, res) => {
+  const { action } = req.body || {};
+  if (!action) return res.status(400).json({ ok: false, error: 'missing action' });
+  // For now just echo back; wire real actions later
+  res.json({ ok: true, action, receivedAt: new Date().toISOString() });
+});
+
+// Ensure PORT is a valid number
+const PORT = Number(process.env.PORT) || 3000;
+app.listen(PORT, () => {
+  console.log(`Server listening on :${PORT}`);
+});
+
 app.listen(PORT, () => {
   console.log(`SP-API proxy listening on :${PORT}`);
 });
