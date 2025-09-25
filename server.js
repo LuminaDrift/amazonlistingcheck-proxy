@@ -320,6 +320,42 @@ app.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
 });
 
+// --- ADD: rotte di controllo ---
+
+// Se hai già `app.use(express.json())`, puoi saltare questa riga:
+app.use(express.json());
+
+// (Opzionale) chiave per proteggere le rotte di controllo: impostala su Render come UI_KEY
+const UI_KEY = process.env.UI_KEY || '';
+
+function checkUiKey(req, res, next) {
+  if (!UI_KEY) return next(); // nessuna chiave richiesta
+  const k = (req.query.k || req.headers['x-ui-key'] || '').toString();
+  if (k === UI_KEY) return next();
+  return res.status(401).json({ ok: false, error: 'unauthorized' });
+}
+
+// /health esiste già nel tuo server e torna JSON; lo lasciamo com'è.
+
+// Stato controllo (GET)
+app.get('/control/status', checkUiKey, (req, res) => {
+  res.json({
+    ok: true,
+    time: new Date().toISOString(),
+    version: process.env.RENDER_GIT_COMMIT || 'dev',
+    sheetId: req.query.sheetId || null
+  });
+});
+
+// Azione di controllo (POST) – per testare una POST semplice
+app.post('/control/action', checkUiKey, (req, res) => {
+  const { action } = req.body || {};
+  if (!action) return res.status(400).json({ ok: false, error: 'missing action' });
+  res.json({ ok: true, action, receivedAt: new Date().toISOString() });
+});
+
+// (Assicurati che sotto ci sia UNA sola app.listen(...))
+
 app.listen(PORT, () => {
   console.log(`SP-API proxy listening on :${PORT}`);
 });
