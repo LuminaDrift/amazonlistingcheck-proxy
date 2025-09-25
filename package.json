@@ -1,0 +1,19 @@
+{
+  "name": "spapi-eligibility-proxy",
+  "version": "1.0.0",
+  "description": "Tiny Node proxy for Amazon SP-API listings restrictions + Google Sheets script",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "check:eu": "node cli.js --eu asins.txt",
+    "check:all": "node cli.js --all asins.txt"
+  },
+  "dependencies": {
+    "amazon-sp-api": "^1.1.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
