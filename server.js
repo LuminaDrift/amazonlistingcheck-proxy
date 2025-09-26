@@ -87,7 +87,7 @@ const clients = {
 
 function getFEClient(profile) {
   const rt = TOKENS.fe[profile];
-  if (!rt) throw new Error(`No FE refresh token for profile '${profile}'`);
+  if (!rt) throw new Error(`Missing SPAPI refresh token for FE profile '${profile.toUpperCase()}'`);
   if (!clients.fe[profile]) clients.fe[profile] = mkClient('fe', rt);
   return clients.fe[profile];
 }
@@ -96,8 +96,16 @@ const feProfileOf = (m) => FE_PROFILE_OF[m] || 'jp';
 
 function spClientForMarketplace(marketplaceId) {
   const r = regionOf(marketplaceId);
-  if (r === 'eu') { if (!clients.eu) clients.eu = mkClient('eu', TOKENS.eu); return clients.eu; }
-  if (r === 'na') { if (!clients.na) clients.na = mkClient('na', TOKENS.na); return clients.na; }
+  if (r === 'eu') {
+    if (!TOKENS.eu) throw new Error('Missing SPAPI_REFRESH_TOKEN_EU environment variable');
+    if (!clients.eu) clients.eu = mkClient('eu', TOKENS.eu);
+    return clients.eu;
+  }
+  if (r === 'na') {
+    if (!TOKENS.na) throw new Error('Missing SPAPI_REFRESH_TOKEN_NA environment variable');
+    if (!clients.na) clients.na = mkClient('na', TOKENS.na);
+    return clients.na;
+  }
   if (r === 'fe') { const p = feProfileOf(marketplaceId); return getFEClient(p); }
   throw new Error(`Unknown marketplaceId: ${marketplaceId}`);
 }
@@ -146,7 +154,6 @@ app.post('/restrictions', async (req, res, next) => {
     if (!asin || !marketplaceIds.length) return res.status(400).json({ error: 'asin + marketplaceIds[] required' });
 
     const results = {};
-    marketplaceIds.forEach(m => results[m] = { exists: true, status: 'Open', reasonCodes: [] });
 
     // Group by region/profile so we can pass correct sellerId/token
     const buckets = { eu: [], na: [], fe: {} };
@@ -158,30 +165,45 @@ app.post('/restrictions', async (req, res, next) => {
     }
 
     if (buckets.eu.length) {
+      if (!SELLER_IDS.eu) throw new Error('Missing SELLER_ID_EU environment variable');
       const sp = spClientForMarketplace('A1F83G8C2ARO7P');
       const data = await callWithRetry(sp, {
         operation: 'getListingsRestrictions', endpoint: 'listingsRestrictions',
         query: { asin, conditionType, marketplaceIds: buckets.eu, sellerId: SELLER_IDS.eu },
       });
-      (data?.restrictions || []).forEach(r => { results[r.marketplaceId] = classify(r.reasons || []); });
+      (data?.restrictions || []).forEach(r => {
+        if (r?.marketplaceId) results[r.marketplaceId] = classify(r.reasons || []);
+      });
     }
     if (buckets.na.length) {
+      if (!SELLER_IDS.na) throw new Error('Missing SELLER_ID_NA environment variable');
       const sp = spClientForMarketplace('ATVPDKIKX0DER');
       const data = await callWithRetry(sp, {
         operation: 'getListingsRestrictions', endpoint: 'listingsRestrictions',
         query: { asin, conditionType, marketplaceIds: buckets.na, sellerId: SELLER_IDS.na },
       });
-      (data?.restrictions || []).forEach(r => { results[r.marketplaceId] = classify(r.reasons || []); });
+      (data?.restrictions || []).forEach(r => {
+        if (r?.marketplaceId) results[r.marketplaceId] = classify(r.reasons || []);
+      });
     }
     for (const [profile, ids] of Object.entries(buckets.fe)) {
       if (!ids.length) continue;
+      if (!SELLER_IDS.fe?.[profile]) throw new Error(`Missing SELLER_ID_FE_${profile.toUpperCase()} environment variable`);
       const sp = getFEClient(profile);
       const data = await callWithRetry(sp, {
         operation: 'getListingsRestrictions', endpoint: 'listingsRestrictions',
         query: { asin, conditionType, marketplaceIds: ids, sellerId: SELLER_IDS.fe[profile] },
       });
-      (data?.restrictions || []).forEach(r => { results[r.marketplaceId] = classify(r.reasons || []); });
+      (data?.restrictions || []).forEach(r => {
+        if (r?.marketplaceId) results[r.marketplaceId] = classify(r.reasons || []);
+      });
     }
+
+    marketplaceIds.forEach(marketplaceId => {
+      if (!results[marketplaceId]) {
+        results[marketplaceId] = { exists: false, status: 'NA', reasonCodes: ['NO_DATA'] };
+      }
+    });
 
     res.json({ asin, conditionType, results });
   } catch (err) { next(err); }
