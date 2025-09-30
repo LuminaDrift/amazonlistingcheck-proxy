@@ -1,195 +1,304 @@
-// server.js — Express proxy/control shim for Amazon listing checks
-// Node >= 18 (global fetch available). package.json should have "type":"module".
-
+// server.js v1.3 — SP-API proxy (restrictions, offers, title) with strict JSON errors (NO /image)
 import express from 'express';
 import cors from 'cors';
+import dotenv from 'dotenv';
+import SellingPartnerAPI from 'amazon-sp-api';
+
+dotenv.config();
 
 const app = express();
-
-// ---------- Config via environment ----------
-const PORT         = Number(process.env.PORT) || 3000;
-const UI_KEY       = process.env.UI_KEY || '';             // optional UI key to protect /control/*
-const UPSTREAM_URL = (process.env.UPSTREAM_URL || '').replace(/\/+$/,''); // optional: proxy to real SP-API worker
-const MOCK_SPAPI   = process.env.MOCK_SPAPI === '0' ? false : true;       // default true when no UPSTREAM_URL
-
-// ---------- Middleware ----------
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '1mb' }));
 
-// Simple UI-key check for /control routes (optional)
-function checkUiKey(req, res, next) {
-  if (!UI_KEY) return next(); // open if not configured
-  const k = (req.query.k || req.headers['x-ui-key'] || '').toString();
-  if (k === UI_KEY) return next();
-  return res.status(401).json({ ok: false, error: 'unauthorized' });
+/* ========= ENV / TOKENS / SELLER IDs ========= */
+const TOKENS = {
+  eu: process.env.SPAPI_REFRESH_TOKEN_EU || '',
+  na: process.env.SPAPI_REFRESH_TOKEN_NA || '',
+  fe: {
+    jp: process.env.SPAPI_REFRESH_TOKEN_FE_JP || '',
+    au: process.env.SPAPI_REFRESH_TOKEN_FE_AU || '',
+  },
+};
+const SELLER_IDS = {
+  eu: process.env.SELLER_ID_EU || '',
+  na: process.env.SELLER_ID_NA || '',
+  fe: {
+    jp: process.env.SELLER_ID_FE_JP || '',
+    au: process.env.SELLER_ID_FE_AU || '',
+  },
+};
+
+// Marketplace → region mapping  (official marketplace IDs; IE/IN/ZA included)
+const REGION_OF = new Map([
+  // NA
+  ['ATVPDKIKX0DER','na'], // US
+  ['A2EUQ1WTGCTBG2','na'], // CA
+  ['A1AM78C64UM0Y8','na'], // MX
+  ['A2Q3Y263D00KWC','na'], // BR
+
+  // EU (incl. EU-managed markets)
+  ['A28R8C7NBKEWEA','eu'], // IE  ✅
+  ['A1RKKUPIHCS9HS','eu'], // ES
+  ['A1F83G8C2ARO7P','eu'], // UK
+  ['A13V1IB3VIYZZH','eu'], // FR
+  ['AMEN7PMS3EDWL','eu'], // BE
+  ['A1805IZSGTT6HS','eu'], // NL
+  ['A1PA6795UKMFR9','eu'], // DE
+  ['APJ6JRA9NG5V4','eu'], // IT
+  ['A2NODRKZP88ZB9','eu'], // SE
+  ['AE08WJ6YKNBMC','eu'], // ZA  ✅
+  ['A1C3SOZRARQ6R3','eu'], // PL
+  ['ARBP9OOSHTCHU','eu'], // EG
+  ['A33AVAJ2PDY3EV','eu'], // TR
+  ['A17E79C6D8DWNP','eu'], // SA
+  ['A2VIGQ35RCS4UG','eu'], // AE
+  ['A21TJRUUN4KGV','eu'], // IN  ✅
+
+  // FE
+  ['A19VAU5U5O7RUS','fe'], // SG
+  ['A39IBJ37TRP1C6','fe'], // AU
+  ['A1VC38T7YXB528','fe'], // JP
+]);
+
+// FE profile map (JP vs AU; SG uses JP profile)
+const FE_PROFILE_OF = {
+  'A1VC38T7YXB528': 'jp', // JP
+  'A39IBJ37TRP1C6': 'au', // AU
+  'A19VAU5U5O7RUS': 'jp', // SG
+  // (IN moved to EU above, so no FE profile for it)
+};
+
+const mkClient = (region, refresh_token) =>
+  new SellingPartnerAPI({
+    region,
+    refresh_token,
+    credentials: {
+      SELLING_PARTNER_APP_CLIENT_ID:     process.env.LWA_CLIENT_ID,
+      SELLING_PARTNER_APP_CLIENT_SECRET: process.env.LWA_CLIENT_SECRET,
+      AWS_ACCESS_KEY_ID:                 process.env.AWS_ACCESS_KEY_ID,
+      AWS_SECRET_ACCESS_KEY:             process.env.AWS_SECRET_ACCESS_KEY,
+      AWS_SELLING_PARTNER_ROLE:          process.env.AWS_ROLE_ARN,
+    },
+  });
+
+const clients = {
+  eu: TOKENS.eu ? mkClient('eu', TOKENS.eu) : null,
+  na: TOKENS.na ? mkClient('na', TOKENS.na) : null,
+  fe: { jp: null, au: null },
+};
+
+function getFEClient(profile) {
+  const rt = TOKENS.fe[profile];
+  if (!rt) throw new Error(`No FE refresh token for profile '${profile}'`);
+  if (!clients.fe[profile]) clients.fe[profile] = mkClient('fe', rt);
+  return clients.fe[profile];
+}
+const regionOf = (m) => REGION_OF.get(m);
+const feProfileOf = (m) => FE_PROFILE_OF[m] || 'jp';
+
+function spClientForMarketplace(marketplaceId) {
+  const r = regionOf(marketplaceId);
+  if (r === 'eu') { if (!clients.eu) clients.eu = mkClient('eu', TOKENS.eu); return clients.eu; }
+  if (r === 'na') { if (!clients.na) clients.na = mkClient('na', TOKENS.na); return clients.na; }
+  if (r === 'fe') { const p = feProfileOf(marketplaceId); return getFEClient(p); }
+  throw new Error(`Unknown marketplaceId: ${marketplaceId}`);
 }
 
-// ---------- Health ----------
-app.get('/health', (req, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
+/* ========= RETRY / HELPERS ========= */
+async function callWithRetry(sp, params, tries = 5, base = 300) {
+  for (let i = 0; i < tries; i++) {
+    try { return await sp.callAPI(params); }
+    catch (e) {
+      const msg = String(e?.code || e?.message || e);
+      const retryable = /429|5\d\d|Throttl|Timeout|EAI_AGAIN|ENETUNREACH/i.test(msg);
+      if (!retryable || i === tries - 1) throw e;
+      await new Promise(r => setTimeout(r, base * Math.pow(2, i)));
+    }
+  }
+}
+
+function classify(reasons) {
+  const ret = { exists: true, status: 'Open', reasonCodes: [] };
+  if (!Array.isArray(reasons) || reasons.length === 0) return ret;
+  const codes = reasons.map(r => r.reasonCode || '').filter(Boolean);
+  if (codes.includes('ASIN_NOT_FOUND'))    return { exists: false, status: 'NA',       reasonCodes: codes };
+  if (codes.includes('APPROVAL_REQUIRED')) return { exists: true,  status: 'Approval', reasonCodes: codes };
+  return { exists: true, status: 'Blocked', reasonCodes: codes };
+}
+
+const pickTitle = (obj) => {
+  if (!obj) return '';
+  return (
+    obj?.attributeSets?.[0]?.title ||
+    obj?.summaries?.[0]?.itemName ||
+    obj?.summaries?.[0]?.brand ||
+    (obj?.attributes?.item_name?.[0]?.value || '') ||
+    obj?.itemName || obj?.brand || ''
+  ) || '';
+};
+
+/* ========= ROUTES ========= */
+
+// --- /restrictions ---
+app.post('/restrictions', async (req, res, next) => {
+  try {
+    const asin = String(req.body.asin || '').trim().toUpperCase();
+    const marketplaceIds = (req.body.marketplaceIds || []).map(String).filter(Boolean);
+    const conditionType = String(req.body.conditionType || 'new_new');
+    if (!asin || !marketplaceIds.length) return res.status(400).json({ error: 'asin + marketplaceIds[] required' });
+
+    const results = {};
+    marketplaceIds.forEach(m => results[m] = { exists: true, status: 'Open', reasonCodes: [] });
+
+    // Group by region/profile so we can pass correct sellerId/token
+    const buckets = { eu: [], na: [], fe: {} };
+    for (const m of marketplaceIds) {
+      const r = regionOf(m);
+      if (r === 'eu') buckets.eu.push(m);
+      else if (r === 'na') buckets.na.push(m);
+      else if (r === 'fe') { const p = feProfileOf(m); (buckets.fe[p] ||= []).push(m); }
+    }
+
+    if (buckets.eu.length) {
+      const sp = spClientForMarketplace('A1F83G8C2ARO7P');
+      const data = await callWithRetry(sp, {
+        operation: 'getListingsRestrictions', endpoint: 'listingsRestrictions',
+        query: { asin, conditionType, marketplaceIds: buckets.eu, sellerId: SELLER_IDS.eu },
+      });
+      (data?.restrictions || []).forEach(r => { results[r.marketplaceId] = classify(r.reasons || []); });
+    }
+    if (buckets.na.length) {
+      const sp = spClientForMarketplace('ATVPDKIKX0DER');
+      const data = await callWithRetry(sp, {
+        operation: 'getListingsRestrictions', endpoint: 'listingsRestrictions',
+        query: { asin, conditionType, marketplaceIds: buckets.na, sellerId: SELLER_IDS.na },
+      });
+      (data?.restrictions || []).forEach(r => { results[r.marketplaceId] = classify(r.reasons || []); });
+    }
+    for (const [profile, ids] of Object.entries(buckets.fe)) {
+      if (!ids.length) continue;
+      const sp = getFEClient(profile);
+      const data = await callWithRetry(sp, {
+        operation: 'getListingsRestrictions', endpoint: 'listingsRestrictions',
+        query: { asin, conditionType, marketplaceIds: ids, sellerId: SELLER_IDS.fe[profile] },
+      });
+      (data?.restrictions || []).forEach(r => { results[r.marketplaceId] = classify(r.reasons || []); });
+    }
+
+    res.json({ asin, conditionType, results });
+  } catch (err) { next(err); }
 });
 
-// ---------- Control (status + test action) ----------
-app.get('/control/status', checkUiKey, (req, res) => {
-  res.json({
-    ok: true,
-    time: new Date().toISOString(),
-    version: process.env.RENDER_GIT_COMMIT || 'dev',
-    hasUpstream: !!UPSTREAM_URL,
-    mockMode: !UPSTREAM_URL && MOCK_SPAPI
-  });
+// --- /offers ---
+app.post('/offers', async (req, res, next) => {
+  try {
+    const asin = String(req.body.asin || '').trim().toUpperCase();
+    const ids = (req.body.marketplaceIds || []).map(String).filter(Boolean);
+    const itemCondition = String(req.body.itemCondition || 'New');
+    if (!asin || !ids.length) return res.status(400).json({ error: 'asin + marketplaceIds[] required' });
+
+    const results = {};
+    for (const mp of ids) {
+      try {
+        const sp = spClientForMarketplace(mp);
+        const r = await callWithRetry(sp, {
+          operation: 'getItemOffers', endpoint: 'productPricing',
+          path: { Asin: asin },
+          query: { MarketplaceId: mp, ItemCondition: itemCondition, CustomerType: 'Consumer' },
+        });
+        const offers = r?.payload?.Offers || r?.Offers || [];
+        results[mp] = { hasNewOffers: offers.length > 0, newOfferCount: offers.length, status: 200 };
+      } catch (err) {
+        results[mp] = { hasNewOffers: false, newOfferCount: 0, status: 0, error: String(err?.message || err) };
+      }
+    }
+    res.json({ asin, results });
+  } catch (e) { next(e); }
 });
 
-app.post('/control/action', checkUiKey, async (req, res) => {
-  const { action, payload } = req.body || {};
-  if (!action) return res.status(400).json({ ok: false, error: 'missing action' });
-  // simple echo/ping
-  if (action === 'ping') {
-    return res.json({ ok: true, pong: true, at: new Date().toISOString(), payload: payload || null });
-  }
-  return res.json({ ok: true, received: { action, payload: payload || null } });
-});
-
-// ---------- Helpers ----------
-function validateBody(req, keys) {
-  const missing = [];
-  keys.forEach(k => { if (req.body == null || !(k in req.body)) missing.push(k); });
-  return missing;
-}
-
-async function proxyPost(path, body) {
-  if (!UPSTREAM_URL) throw new Error('UPSTREAM_URL not configured');
-  const url = `${UPSTREAM_URL}${path.startsWith('/') ? path : `/${path}`}`;
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type':'application/json' },
-    body: JSON.stringify(body),
-  });
-  const text = await r.text();
-  let json;
-  try { json = JSON.parse(text); } catch {
-    throw new Error(`Upstream non-JSON response: ${text.slice(0,200)}`);
-  }
-  if (!r.ok) {
-    const msg = (json && (json.error || json.message)) ? json.error || json.message : `HTTP ${r.status}`;
-    const err = new Error(`Upstream error: ${msg}`);
-    err.status = r.status;
-    err.payload = json;
-    throw err;
-  }
-  return json;
-}
-
-// ---------- Mock generators (structure-compatible) ----------
-function mockRestrictions(asin, marketplaceIds) {
-  const results = {};
-  (marketplaceIds || []).forEach(m => {
-    // deterministic-ish mock: Open if asin ends with 0–4
-    const last = asin.slice(-1);
-    const openish = /[0-4]/.test(last);
-    results[m] = {
-      exists: true,
-      status: openish ? 'Open' : 'Restricted',
-      reasonCodes: openish ? [] : ['BRAND_RESTRICTED'],
-    };
-  });
-  return { ok: true, results };
-}
-function mockOffers(asin, marketplaceIds) {
-  const results = {};
-  (marketplaceIds || []).forEach(m => {
-    const last = asin.slice(-1);
-    const has = /[02468]/.test(last); // even => has offers
-    results[m] = { hasNewOffers: !!has };
-  });
-  return { ok: true, results };
-}
-
-// ---------- Business endpoints ----------
-// Single-ASIN restrictions (expects { asin, marketplaceIds, conditionType? })
-app.post('/restrictions', async (req, res) => {
-  const missing = validateBody(req, ['asin','marketplaceIds']);
-  if (missing.length) return res.status(400).json({ ok:false, error:`missing fields: ${missing.join(', ')}` });
+// --- /title (optional; not used by your Sheet but kept) ---
+async function fetchTitleOnce(asin, marketplaceId) {
+  const sp = spClientForMarketplace(marketplaceId);
 
   try {
-    if (UPSTREAM_URL) {
-      const j = await proxyPost('/restrictions', req.body);
-      return res.json(j);
-    }
-    if (!MOCK_SPAPI) return res.status(501).json({ ok:false, error:'Not configured (set UPSTREAM_URL or enable MOCK_SPAPI)' });
-    return res.json(mockRestrictions(String(req.body.asin), req.body.marketplaceIds));
-  } catch (err) {
-    const code = err.status || 502;
-    return res.status(code).json({ ok:false, error: err.message || 'upstream error', details: err.payload || null });
-  }
-});
-
-// Single-ASIN offers (expects { asin, marketplaceIds, itemCondition?, includeSiblings? })
-app.post('/offers', async (req, res) => {
-  const missing = validateBody(req, ['asin','marketplaceIds']);
-  if (missing.length) return res.status(400).json({ ok:false, error:`missing fields: ${missing.join(', ')}` });
+    const d = await callWithRetry(sp, {
+      operation: 'getCatalogItem', endpoint: 'catalogItems',
+      path: { asin }, query: { MarketplaceId: marketplaceId }
+    });
+    const t = pickTitle(d?.payload || d);
+    if (t) return t;
+  } catch (_) {}
 
   try {
-    if (UPSTREAM_URL) {
-      const j = await proxyPost('/offers', req.body);
-      return res.json(j);
-    }
-    if (!MOCK_SPAPI) return res.status(501).json({ ok:false, error:'Not configured (set UPSTREAM_URL or enable MOCK_SPAPI)' });
-    return res.json(mockOffers(String(req.body.asin), req.body.marketplaceIds));
-  } catch (err) {
-    const code = err.status || 502;
-    return res.status(code).json({ ok:false, error: err.message || 'upstream error', details: err.payload || null });
-  }
-});
-
-// Optional: batch restrictions (expects { asins:[], marketplaceIds:[] })
-app.post('/restrictions/batch', async (req, res) => {
-  const missing = validateBody(req, ['asins','marketplaceIds']);
-  if (missing.length) return res.status(400).json({ ok:false, error:`missing fields: ${missing.join(', ')}` });
-  const { asins, marketplaceIds } = req.body;
+    const d = await callWithRetry(sp, {
+      operation: 'getCatalogItem', endpoint: 'catalogItems_2022_04_01',
+      path: { asin }, query: { marketplaceIds: [marketplaceId], includedData: ['summaries'] }
+    });
+    const sums = Array.isArray(d?.summaries) ? d.summaries : d?.payload?.summaries || null;
+    const s = sums?.find(x => x.marketplaceId === marketplaceId) || sums?.[0];
+    const t = pickTitle(s);
+    if (t) return t;
+  } catch (_) {}
 
   try {
-    if (UPSTREAM_URL) {
-      const j = await proxyPost('/restrictions/batch', req.body);
-      return res.json(j);
-    }
-    if (!MOCK_SPAPI) return res.status(501).json({ ok:false, error:'Not configured (set UPSTREAM_URL or enable MOCK_SPAPI)' });
-    const out = {};
-    asins.forEach(a => { out[a] = mockRestrictions(String(a), marketplaceIds).results; });
-    return res.json({ ok:true, results: out });
-  } catch (err) {
-    const code = err.status || 502;
-    return res.status(code).json({ ok:false, error: err.message || 'upstream error', details: err.payload || null });
-  }
-});
-
-// Optional: batch offers (expects { asins:[], marketplaceIds:[] })
-app.post('/offers/batch', async (req, res) => {
-  const missing = validateBody(req, ['asins','marketplaceIds']);
-  if (missing.length) return res.status(400).json({ ok:false, error:`missing fields: ${missing.join(', ')}` });
-  const { asins, marketplaceIds } = req.body;
+    const d = await callWithRetry(sp, {
+      operation: 'getCatalogItem', endpoint: 'catalogItems_2022_04_01',
+      path: { asin }, query: { marketplaceIds: marketplaceId, includedData: 'summaries' }
+    });
+    const sums = Array.isArray(d?.summaries) ? d.summaries : d?.payload?.summaries || null;
+    const s = sums?.find(x => x.marketplaceId === marketplaceId) || sums?.[0];
+    const t = pickTitle(s);
+    if (t) return t;
+  } catch (_) {}
 
   try {
-    if (UPSTREAM_URL) {
-      const j = await proxyPost('/offers/batch', req.body);
-      return res.json(j);
-    }
-    if (!MOCK_SPAPI) return res.status(501).json({ ok:false, error:'Not configured (set UPSTREAM_URL or enable MOCK_SPAPI)' });
-    const out = {};
-    asins.forEach(a => { out[a] = mockOffers(String(a), marketplaceIds).results; });
-    return res.json({ ok:true, results: out });
-  } catch (err) {
-    const code = err.status || 502;
-    return res.status(code).json({ ok:false, error: err.message || 'upstream error', details: err.payload || null });
-  }
+    const d3 = await callWithRetry(sp, {
+      operation: 'searchCatalogItems', endpoint: 'catalogItems',
+      query: { MarketplaceId: marketplaceId, Identifiers: [asin], IdentifiersType: 'ASIN' }
+    });
+    const item = d3?.items?.[0] || d3?.payload?.items?.[0];
+    const t = pickTitle(item?.summaries?.[0]) || pickTitle(item);
+    if (t) return t;
+  } catch (_) {}
+
+  try {
+    const d4 = await callWithRetry(sp, {
+      operation: 'searchCatalogItems', endpoint: 'catalogItems',
+      query: { MarketplaceId: marketplaceId, keywords: asin }
+    });
+    const item = d4?.items?.[0] || d4?.payload?.items?.[0];
+    const t = pickTitle(item?.summaries?.[0]) || pickTitle(item);
+    if (t) return t;
+  } catch (_) {}
+
+  return '';
+}
+
+app.get('/title', async (req, res, next) => {
+  try {
+    const asin = String(req.query.asin || '').trim().toUpperCase();
+    const marketplaceId = String(req.query.marketplaceId || '').trim();
+    if (!asin || !marketplaceId) return res.status(400).json({ error: 'asin & marketplaceId required' });
+    const title = await fetchTitleOnce(asin, marketplaceId);
+    if (!title) return res.status(404).json({ error: 'Title not found' });
+    res.json({ asin, marketplaceId, title });
+  } catch (e) { next(e); }
 });
 
-// ---------- 404 handler ----------
+/* ========= HEALTH / VERSION ========= */
+app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/version', (_req, res) => res.json({ version: '1.3' }));
+
+/* ========= JSON-ONLY ERROR HANDLERS ========= */
 app.use((req, res) => {
-  res.status(404).json({ ok:false, error:'not found', path:req.path });
+  res.status(404).json({ error: 'Not found', path: req.originalUrl });
+});
+app.use((err, req, res, _next) => {
+  const status = typeof err?.status === 'number' ? err.status : 500;
+  res.status(status).json({ error: String(err?.message || err), code: err?.code || undefined });
 });
 
-// ---------- Start server (single listen) ----------
-app.listen(PORT, () => {
-  console.log(`Server listening on ${PORT} ${UPSTREAM_URL ? '(proxy mode)' : (MOCK_SPAPI ? '(mock mode)' : '')}`);
-});
+process.on('unhandledRejection', (e) => { console.error('UNHANDLED:', e); });
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`SP-API proxy ready on port ${port} (v1.3)`));
