@@ -146,7 +146,14 @@ app.post('/restrictions', async (req, res, next) => {
     if (!asin || !marketplaceIds.length) return res.status(400).json({ error: 'asin + marketplaceIds[] required' });
 
     const results = {};
-    marketplaceIds.forEach(m => results[m] = { exists: true, status: 'Open', reasonCodes: [] });
+    const setClosed = (id, reason) => {
+      results[id] = {
+        exists: false,
+        status: 'NA',
+        reasonCodes: reason ? [reason] : ['NO_DATA'],
+      };
+    };
+    marketplaceIds.forEach(m => setClosed(m));
 
     // Group by region/profile so we can pass correct sellerId/token
     const buckets = { eu: [], na: [], fe: {} };
@@ -163,7 +170,14 @@ app.post('/restrictions', async (req, res, next) => {
         operation: 'getListingsRestrictions', endpoint: 'listingsRestrictions',
         query: { asin, conditionType, marketplaceIds: buckets.eu, sellerId: SELLER_IDS.eu },
       });
-      (data?.restrictions || []).forEach(r => { results[r.marketplaceId] = classify(r.reasons || []); });
+      const seen = new Set();
+      (data?.restrictions || []).forEach(r => {
+        if (r?.marketplaceId) {
+          seen.add(r.marketplaceId);
+          results[r.marketplaceId] = classify(r.reasons || []);
+        }
+      });
+      buckets.eu.forEach(id => { if (!seen.has(id)) setClosed(id, 'NO_RESTRICTIONS'); });
     }
     if (buckets.na.length) {
       const sp = spClientForMarketplace('ATVPDKIKX0DER');
@@ -171,7 +185,14 @@ app.post('/restrictions', async (req, res, next) => {
         operation: 'getListingsRestrictions', endpoint: 'listingsRestrictions',
         query: { asin, conditionType, marketplaceIds: buckets.na, sellerId: SELLER_IDS.na },
       });
-      (data?.restrictions || []).forEach(r => { results[r.marketplaceId] = classify(r.reasons || []); });
+      const seen = new Set();
+      (data?.restrictions || []).forEach(r => {
+        if (r?.marketplaceId) {
+          seen.add(r.marketplaceId);
+          results[r.marketplaceId] = classify(r.reasons || []);
+        }
+      });
+      buckets.na.forEach(id => { if (!seen.has(id)) setClosed(id, 'NO_RESTRICTIONS'); });
     }
     for (const [profile, ids] of Object.entries(buckets.fe)) {
       if (!ids.length) continue;
@@ -180,7 +201,14 @@ app.post('/restrictions', async (req, res, next) => {
         operation: 'getListingsRestrictions', endpoint: 'listingsRestrictions',
         query: { asin, conditionType, marketplaceIds: ids, sellerId: SELLER_IDS.fe[profile] },
       });
-      (data?.restrictions || []).forEach(r => { results[r.marketplaceId] = classify(r.reasons || []); });
+      const seen = new Set();
+      (data?.restrictions || []).forEach(r => {
+        if (r?.marketplaceId) {
+          seen.add(r.marketplaceId);
+          results[r.marketplaceId] = classify(r.reasons || []);
+        }
+      });
+      ids.forEach(id => { if (!seen.has(id)) setClosed(id, 'NO_RESTRICTIONS'); });
     }
 
     res.json({ asin, conditionType, results });
