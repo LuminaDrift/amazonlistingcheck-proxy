@@ -1,10 +1,8 @@
 // server.js v1.3 — SP-API proxy (restrictions, offers, title) with strict JSON errors (NO /image)
-import express from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import SellingPartnerAPI from 'amazon-sp-api';
-
-dotenv.config();
+const express = require('express');
+const cors = require('cors');
+require('dotenv').config();
+const SellingPartnerAPI = require('amazon-sp-api');
 
 const app = express();
 app.use(cors());
